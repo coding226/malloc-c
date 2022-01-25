@@ -1,0 +1,3 @@
+Intel(R)Xeon(R)CPUE5-1620v3@3.50GHz:regular:20092
+Intel(R)Core(TM)i7-5500UCPU@2.40GHz:regular:16936
+Intel(R)Core(TM)i5CPUM460@2.53GHz:regular:11680
