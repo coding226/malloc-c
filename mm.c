@@ -1,9 +1,9 @@
 /*
  * mm.c
  *
- * Name: iamgives@gmail.com 
+ * Name: Malav Patel
  *
- * Dynamic memory allocator.
+ * INSERT: HIGH LEVEL DESCRIPTION OF SOL
  * 
  * 
  *
@@ -24,7 +24,7 @@
  * uncomment the following line. Be sure not to have debugging enabled
  * in your final submission.
  */
-//#define DEBUG
+//#define DEBUG 2
 
 #ifdef DEBUG
 /* When debugging is enabled, the underlying functions get called */
@@ -47,400 +47,432 @@
 #define memcpy mem_memcpy
 #endif /* DRIVER */
 
-static void printlist(void);
+static void printFree(void);
+static void printHeap(void);
+static size_t get_free_index ( size_t bsize );
 
-/* One block of memory with Header and payload */
-typedef struct Block {
-    struct Block *next_free,    /* Pointer to next free block    */
-                 *next;         /* Pointer to next block         */
-    long   data[1];             /* Payload */
-    size_t bsize;               /* Block size in the end of the block */
-} Block;
+typedef struct free_list {
+    void * bp;
+    struct free_list * next;
+} free_list;
 
-#define HEADER_SIZE (sizeof(Block)-sizeof(long))
+static char *heap_listp = 0;
 
-static Block *head_list = NULL, /* head list of blocks */
-             *tail_list = NULL, /* tail list of blocks */
-             *head_free = NULL; /* head list of free blocks */
+enum {
+    BSZ_32   ,
+    BSZ_64   ,
+    BSZ_128  ,
+    BSZ_256  ,
+    BSZ_512  ,
+    BSZ_1024 ,
+    BSZ_2048 ,
+    BSZ_4096 ,
+    BSZ_8192 ,
+    BSZ_LEN
+};
 
-static size_t bsize_of_minblock = 0,    /* minimal size of block    */
-              bsize_of_allblock = 0;    /* total size of all blocks */
+static size_t * free_head[BSZ_LEN];
+
+static size_t total = 0;
+
+/* What is the correct alignment? */
+#define ALIGNMENT 16
+
+static size_t WSIZE = 8;
+
+static size_t DSIZE = 16;
+
+static size_t CHUNKSIZE  = (1<<12); 
+
+static size_t MAX(size_t x, size_t y) {
+    if (x > y){
+        return x;
+    }
+    else{
+        return y;
+    }
+}
+
+static size_t PACK(size_t size, size_t alloc){
+    return (size|alloc);
+}
+static size_t GET(void* p){
+    return (*(size_t*)(p));
+}
+static size_t PUT(void* p, size_t val) {
+    return (*(size_t *)(p) = (val));
+}
+
+static size_t GET_SIZE(size_t* p) {
+    return (GET(p) & ~0x7);
+}
+
+static size_t GET_ALLOC(size_t* p){
+    return (GET(p) & 0x1);
+}
+
+static void* HDRP(void *bp){
+    return ((char *)(bp) - WSIZE);
+}
+
+static void* FTRP(void* bp){
+    return ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE);
+}
+
+static void* NEXT_BLKP(void* bp){
+    return ((char *)(bp) + GET_SIZE(((bp) - WSIZE)));
+}
+
+static void* PREV_BLKP(void* bp){
+    return ((char *)(bp) - GET_SIZE(((bp) - DSIZE)));
+}
 
 
-/* rounds up the size to the nearest multiple of ALIGNMENT */
-static size_t
-align_size ( size_t size ){
-    size_t bsize = size + HEADER_SIZE;
-    if ( bsize & 0xF )
-        bsize = ((bsize >> 4) + 1uLL ) << 4;
-    return bsize;
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+static size_t align(size_t x)
+{
+    return ALIGNMENT * ((x+ALIGNMENT-1)/ALIGNMENT);
+}
+
+static void unlink2 ( size_t * bp, size_t ** head ){
+    if ( bp[0] )
+        ((size_t*)bp[0])[1] = bp[1];
+    if ( bp[1] )
+        ((size_t*)bp[1])[0] = bp[0];
+
+    if ( *head == bp )
+        *head = (size_t*)bp[1];
+}
+
+static void linkh ( size_t * bp, size_t ** head ){
+    bp[0] = 0;
+    bp[1] = (size_t)(*head);
+    if ( *head )
+        (*head)[0] = (size_t)bp;
+    *head = bp;
+}
+
+static void *coalesce(void *bp) 
+{
+    size_t*prev = PREV_BLKP(bp),
+          *next = NEXT_BLKP(bp);
+    size_t prev_alloc = GET_ALLOC(FTRP(prev));
+    size_t next_alloc = GET_ALLOC(HDRP(next));
+    size_t size = GET_SIZE(HDRP(bp)), old_size, nxt_size;
+    size_t * p = (size_t*)bp;
+    size_t old_index, index, nxt_index;
+
+    if (prev_alloc && next_alloc) {            /* Case 1 */
+        index = get_free_index(size);
+        p[0] = 0;
+        p[1] = 0;
+        if ( free_head[index] ){
+            p[1] = (size_t)free_head[index];
+            free_head[index][0] = (size_t)p;
+        }
+        free_head[index] = p;
+
+        return bp;
+    }
+
+    else if (prev_alloc && !next_alloc) {      /* Case 2  A  A->F F */
+        old_size  = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        old_index = get_free_index ( old_size );
+
+        size += old_size;
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size,0));
+
+        index = get_free_index ( size );
+
+        p[0] = next[0];
+        p[1] = next[1];
+
+        if ( p[0] )
+            ((size_t*)p[0])[1] = (size_t)p;
+        if ( p[1] )
+            ((size_t*)p[1])[0] = (size_t)p;
+
+        if ( next == free_head[index] )
+            free_head[index] = p;
+
+        if ( old_index != index ){
+            unlink2 ( next, free_head + old_index );
+            linkh   ( p   , free_head +     index );
+        } 
+
+    }
+
+    else if (!prev_alloc && next_alloc) {      /* Case 3  F A->F A */
+        old_size  = GET_SIZE(HDRP(PREV_BLKP(bp)));
+        old_index = get_free_index ( old_size ); 
+
+        size += old_size;
+        PUT(FTRP(bp), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        bp = PREV_BLKP(bp);
+
+        index = get_free_index ( size );
+
+        if ( old_index != index ){
+            unlink2 ( bp, free_head + old_index );
+            linkh   ( bp, free_head +     index );
+        }
+    }
+
+    else {                                     /* Case 4 */
+        old_size  = GET_SIZE(HDRP(PREV_BLKP(bp)));
+        nxt_size  = GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        old_index = get_free_index ( old_size );
+        nxt_index = get_free_index ( nxt_size );
+
+        size += old_size + nxt_size;
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        bp = PREV_BLKP(bp);
+
+        index = get_free_index ( size );
+
+        unlink2 ( next, free_head + nxt_index );
+
+        if ( old_index != index ){
+            unlink2 ( bp, free_head + old_index );
+            linkh   ( bp, free_head +     index );
+        }
+    }
+    return bp;
+}
+
+static void *extend_heap(size_t words) 
+{
+    char *bp;
+    size_t size;
+  
+    size = (words % 2) ? (words+1) * WSIZE : words * WSIZE; 
+
+    if ((long)(bp = mem_sbrk(size)) == -1)  
+        return NULL;                                   
+
+    total += size;
+  
+    PUT(HDRP(bp), PACK(size, 0));         
+    PUT(FTRP(bp), PACK(size, 0));        
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); 
+
+    return coalesce ( bp );
 }
 
 /*
  * Initialize: returns false on error, true on success.
  */
-bool 
-mm_init(void){
+bool mm_init(void)
+{
+    memset( free_head, 0, sizeof(free_head) );
 
-    head_list = tail_list = head_free = NULL;
+    /* Create the initial empty heap */
+    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1)
+        return false;
+    total += 4*WSIZE;
+    PUT(heap_listp, 0);
+    /* Alignment padding */
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1)); /* Prologue header */
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /* Prologue footer */
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* Epilogue header */
+    heap_listp += (2*WSIZE);
 
-    bsize_of_allblock = 0;
-    bsize_of_minblock = align_size (1);
-
-    dbg_printf("\n ******** mm_init ******************\n\n");
+    /* Extend the empty heap with a free block of CHUNKSIZE bytes */
+    if (extend_heap(CHUNKSIZE/WSIZE) == NULL){
+        mm_checkheap(0);
+        return false;
+    }
+    mm_checkheap(0);
 
     return true;
 }
 
-
-
-/* Store size of the block at the end of the block */
-static void
-set_block_size ( Block * bp, size_t bsize ){
-    *((size_t*)bp + bsize/sizeof(size_t) - 1) = bsize;
+static unsigned long pof2 (unsigned long v)
+{
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v++;
+    return v;
 }
 
-/* Return size of the block */
-static size_t
-get_block_size ( Block * bp ){
-    size_t bsize;
-    if ( bp == tail_list ){
-        bsize = *((size_t*)head_list + bsize_of_allblock/sizeof(size_t) - 1);
-    }
-    else {
-        bsize = *((size_t*)bp -> next - 1);
-    }
-    return bsize & ~1ull;
+static size_t get_free_index ( size_t bsize ){
+    if ( bsize <=   32 ) return BSZ_32;
+    if ( bsize <=   64 ) return BSZ_64;
+    if ( bsize <=  128 ) return BSZ_128;
+    if ( bsize <=  256 ) return BSZ_256;
+    if ( bsize <=  512 ) return BSZ_512;
+    if ( bsize <= 1024 ) return BSZ_1024;
+    if ( bsize <= 2048 ) return BSZ_2048;
+    if ( bsize <= 4096 ) return BSZ_4096;
+    return BSZ_8192;
 }
 
-/* Check if the block free*/
-static int
-is_block_free ( Block * bp, size_t bsize ){
-    return !((*((size_t*)bp + bsize/sizeof(size_t) - 1)) & 1 );
-}
+static void *find_fit(size_t asize)
 
-/* Mark the block as free */
-static void
-set_block_free ( Block * bp, size_t bsize ){
-    size_t
-    *psize = (size_t*)bp + bsize/sizeof(size_t) - 1;
-    *psize ^= 1;
-}
-
-/* Mark the block as no free */
-static void
-set_block_allc ( Block * bp, size_t bsize ){
-    size_t
-    *psize = (size_t*)bp + bsize/sizeof(size_t) - 1;
-    *psize |= 1;
-}
-
-/* Get prev block by size */
-static Block*
-prev_block ( Block * bp ){
-    size_t prev_size = *((size_t*)bp-1) & ~1ull;
-    return (Block*)((char*)bp - prev_size);
-}
-
-/* Get next block by size */
-static Block*
-next_block ( Block * bp ){
-    return (Block*)((char*)bp + get_block_size(bp));
-}
-
-/* Find the first  fit-free block */
-static Block*
-find_fit(size_t bsize, Block **prev_free){
-    Block * bp;
-    for ( bp = head_free, *prev_free = NULL; bp; bp = bp -> next_free ){
-        size_t bp_bsize = get_block_size ( bp );
-        if ( bp_bsize >= bsize )
-            break;
-        *prev_free = bp;
-    }
-    return bp;
-}
-
-/* Split free block by two if possible  */
-static Block*
-split_block ( Block * bp, size_t bsize, size_t * new_bsize ){
-    Block *bp_new  = (Block*)((char*)bp + bsize);
-
-    size_t old_size = get_block_size(bp),
-           new_size = old_size - bsize;
-
-    *new_bsize = old_size;
-    /* Size of the new block must be greater than min block size */
-    if (  new_size >= bsize_of_minblock ){               
-
-        /* fix size of blocks */
-        set_block_size ( bp    , bsize    );
-        set_block_size ( bp_new, new_size );
-
-        bp_new -> next      = bp -> next;
-        bp_new -> next_free = bp -> next_free;
-
-        bp -> next      = bp_new;
-        bp -> next_free = bp_new;
-
-        if ( tail_list == bp )
-            tail_list = bp_new;
-
-        *new_bsize = bsize;
-    }
-
-    return bp;
-}
-
-/* Mark a free block as no free */
-static void
-alloc_block ( Block * bp, size_t bsize, Block * prev_free ){
-
-    set_block_allc ( bp, bsize );
-
-    if ( prev_free ){
-        prev_free -> next_free = bp -> next_free;
-    }
-
-    if ( head_free == bp )
-        head_free = bp -> next_free;
-
-    //bp -> next_free = NULL;
-}
-
-/* Return start of the block by pointer (from malloc, free) */
-static Block*
-get_block_ptr ( void *ptr ){
-    return (Block*)((char*)ptr - 2*sizeof(void*));
-}
-
-/* Return size of data in the Block */
-static size_t
-get_data_size ( Block * bp ){
-    size_t s =  get_block_size(bp);
-    return s - HEADER_SIZE; 
-}
-
-/* Extend the process heap */
-static Block *
-extend_heap (size_t bsize, Block * prev_free){
-    /* min alloc equal pagesize */
-    size_t pagesize = 4096;//mem_pagesize();
-
-    bsize = (bsize/pagesize+1)*pagesize;
-
-    Block* bp = (Block*) mem_sbrk ( bsize );
-    if ( bp != (Block*) -1 ){
-        if ( tail_list ){
-            //size_t tail_bsize = get_block_size ( tail_list);
-            //if ( !is_block_free ( tail_list, tail_bsize) ){
-
-                bp -> next      = NULL;
-                bp -> next_free = NULL;
-
-                set_block_size ( bp, bsize );
-
-                tail_list -> next = bp;
-                tail_list = bp;
-
-                if ( prev_free )
-                    prev_free -> next_free = bp;
-                else
-                    head_free = bp;
-
-            //}
-            //else {
-            //    set_block_size ( tail_list, bsize + tail_bsize );
-            //    bp = tail_list;
-            //}
+{
+    size_t index = get_free_index (asize);
+#if 0
+    void *bp;
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+            return bp;
         }
-        else{
-            head_list = tail_list = head_free = (Block*)bp;
-            tail_list -> next      = NULL;
-            tail_list -> next_free = NULL;
-            set_block_size ( bp, bsize );
-        }
-
-        bsize_of_allblock += bsize;
     }
-    else
-        bp = NULL;
-
-    return bp;
+#else
+    size_t *bp;
+    for ( int i = index; i < BSZ_LEN; ++i ){
+        for (bp = free_head[i]; bp ; bp = (size_t*)bp[1] ){
+            if (asize <= GET_SIZE(HDRP(bp))) 
+                return bp;
+        }
+    }
+#endif
+    return NULL; /* No fit */
 }
-
  
 
+static void place(void *bp, size_t asize)
+{
+    size_t csize = GET_SIZE(HDRP(bp));   
+    size_t * p = (size_t*)bp; 
+
+    size_t index, old_index; 
+
+    if ((csize - asize) >= (2*DSIZE)) { 
+        old_index = get_free_index ( csize );
+
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK(csize-asize, 0));
+        PUT(FTRP(bp), PACK(csize-asize, 0));
+
+        index = get_free_index ( csize-asize );
+        size_t * next = (size_t*)bp;
+        next[0] = p[0];
+        next[1] = p[1];
+        if ( p[0] )
+            ((size_t*)p[0])[1] = (size_t)next;
+        if ( p[1] )
+            ((size_t*)p[1])[0] = (size_t)next;
+
+        if ( p == free_head[old_index] )
+            free_head[old_index] = next;
+
+        if ( old_index != index ){
+            unlink2 ( next, free_head + old_index );
+            linkh   ( next, free_head +     index );
+        }
+    }
+    else { 
+        index = get_free_index ( csize );
+        if ( p[0] )
+            ((size_t*)p[0])[1] = p[1];
+        if ( p[1] )
+            ((size_t*)p[1])[0] = p[0];
+        if ( p == free_head[index] )
+            free_head[index] = (size_t*)p[1];
+
+        PUT(HDRP(bp), PACK(csize, 1));
+        PUT(FTRP(bp), PACK(csize, 1));
+    }
+}
 /*
  * malloc
  */
-void* 
-malloc(size_t size){
-    Block *bp = NULL, *prev_free = NULL; 
-    //mm_checkheap (__LINE__);
-    if (size){
-        /* bsize is multiple 16 */
-        size_t bsize = align_size ( size );
-        /* search the first free block */
-        bp = find_fit ( bsize, &prev_free );
+void* malloc(size_t size)
+{
+    size_t asize;      /* Adjusted block size */
+    size_t extendsize; /* Amount to extend heap if no fit */
+    char *bp;      
 
-        /* if no free block expand the heap */
-        if ( !bp ){
-            bp = extend_heap ( bsize, prev_free );
-        }
 
-        if ( bp ){
-            size_t new_bsize;
-            /* try to split */
-            split_block ( bp, bsize, &new_bsize );
-            /* mark as no free */
-            alloc_block ( bp, new_bsize, prev_free );
-        }
+    /* $end mmmalloc */
+    if (heap_listp == 0){
+        mm_init();
+    }
+    /* $begin mmmalloc */
+    /* Ignore spurious requests */
+    if (size == 0)
+        return NULL;
 
-        dbg_printf("\nmalloc: %p  bp %p size=%ld bsize=%ld\n",&bp->data[0],bp,size,bsize);
+    /* Adjust block size to include overhead and alignment reqs. */
+    if (size <= DSIZE)                                       
+        asize = 2*DSIZE;                       
+    else
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
+
+    /* Search the free list for a fit */
+    if ((bp = find_fit(asize)) != NULL) {  
+        place(bp, asize);                 
+        dbg_printf( "malloc: %p  %lu\n",bp,size);
+        #if defined DEBUG && DEBUG > 1
+        printHeap(); printFree(); printf("+++++++++++++++++++++++++++++\n\n");
+        #endif
+        return bp;
     }
 
-    mm_checkheap (__LINE__);
+    /* No fit found. Get more memory and place the block */
+    extendsize = MAX(asize,CHUNKSIZE);              
+    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)  
+        return NULL;                                
+    place(bp, asize);                                
 
-    return bp ? &bp -> data[0] : NULL;
+    dbg_printf( "malloc: %p  %lu\n",bp,size);
+
+    #if defined DEBUG && DEBUG > 1
+    printHeap(); printFree(); printf("+++++++++++++++++++++++++++++\n\n");
+    #endif
+
+    mm_checkheap(0);
+    return bp;
 } 
-
-/* Find a previous free block than point at the block */
-static Block*
-find_prev_free ( Block * bp ){
-    Block* prev_free = NULL, *p;
-
-    for ( p = head_free; p; p = p -> next_free ){
-        if ( p == bp )
-            break;
-        prev_free = p;
-    }
-
-    return prev_free;
-}
 
 /*
  * free
  */
-void 
-free(void* ptr){
-    Block * bp = get_block_ptr ( ptr ),
-          * bp_prev = NULL,
-          * bp_next = NULL;
-    size_t  sz_prev = 0,
-            sz_next = 0;
+void free(void* ptr)
+{
 
-    bool prev_free = false, next_free = false;
+    dbg_printf( "free  : %p\n",ptr);
+    size_t size = GET_SIZE(HDRP(ptr));
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
 
-    dbg_printf("\nfree  : %p  bp %p\n",ptr,bp);
+    coalesce ( ptr );
+    #if defined DEBUG && DEBUG > 1
+    printHeap(); printFree(); printf("-----------------------------\n\n");
+    #endif
 
-    if ( head_list != bp ){
-        bp_prev   = prev_block (bp);
-        sz_prev   = get_block_size ( bp_prev );
-        prev_free = is_block_free  ( bp_prev, sz_prev );
-    }
-    if ( tail_list != bp ){
-        bp_next   = bp -> next;
-        sz_next   = get_block_size ( bp_next );
-        next_free = is_block_free  ( bp_next, sz_next );
-    }
-
-    size_t bsize = get_block_size ( bp );
-
-    set_block_free ( bp, bsize );
-
-    /* merge with the previous */
-    if (  prev_free && !next_free ){
-
-        set_block_size ( bp_prev, sz_prev + bsize );
-
-        bp_prev -> next = bp -> next;
-
-        if ( bp == tail_list )
-            tail_list = bp_prev;
-    }
-    else
-    /* merge with the next */
-    if ( !prev_free && next_free  ){
-
-        set_block_size ( bp, sz_next + bsize );
-
-        bp -> next = bp_next -> next;
-
-        if ( bp_next == tail_list )
-            tail_list = bp;
-
-        Block* prev_free = find_prev_free ( bp_next );
-
-        if ( prev_free )
-            prev_free -> next_free = bp;
-        else
-        if ( head_free == bp_next )
-            head_free = bp;
-
-        bp -> next_free = bp_next -> next_free;
-
-    }
-    else
-    /* merge with the previous and the next */
-    if (  prev_free && next_free  ){
-
-        set_block_size ( bp_prev, sz_prev + sz_next + bsize );
-
-        bp_prev -> next = bp_next -> next;
-
-        if ( bp_next == tail_list )
-            tail_list = bp_prev;
-
-        Block* prev_free = find_prev_free ( bp_next );
-        if ( prev_free )
-            prev_free -> next_free = bp_next -> next_free;
-        else
-        if ( head_free == bp_next )
-            head_free = bp_next -> next_free;
-    }
-    else 
-    if ( !prev_free && !next_free ){
-        if ( head_free )
-            bp -> next_free = head_free;
-        else
-            bp -> next_free = NULL;
-        head_free = bp;
-    }
-
-    mm_checkheap ( __LINE__ );
+    mm_checkheap(0);
 }
 
 /*
  * realloc
  */
-void* 
-realloc(void* oldptr, size_t size) {
+void* realloc(void* oldptr, size_t size)
+{
     size_t oldsize;
     void *newptr;
-
-    mm_checkheap (__LINE__ );
 
     /* If size == 0 then this is just free, and we return NULL. */
     if(size == 0) {
         free(oldptr);
-        return NULL;
+        return 0;
     }
 
     /* If oldptr is NULL, then this is just malloc. */
     if(oldptr == NULL) {
         return malloc(size);
     }
-
-    Block * bp = get_block_ptr ( oldptr ); 
-    /*
-    TODO: add merge with next free block
-
-    size_t new_bsize = align_size ( size );
-
-    if ( bp -> next && bp -> next -> bsize + bp -> bsize >= new_bsize ){    
-    }
-    */
 
     newptr = malloc(size);
 
@@ -449,17 +481,13 @@ realloc(void* oldptr, size_t size) {
         return 0;
     }
 
-    //Block * bp_new = get_block_ptr ( newptr );
-
     /* Copy the old data. */
-    oldsize = get_data_size ( bp );
+    oldsize = GET_SIZE(HDRP(oldptr));
     if(size < oldsize) oldsize = size;
     memcpy(newptr, oldptr, oldsize);
 
     /* Free the old block. */
     free(oldptr);
-
-    mm_checkheap (__LINE__ );
 
     return newptr;
 }
@@ -467,8 +495,8 @@ realloc(void* oldptr, size_t size) {
  * calloc
  * This function is not tested by mdriver, and has been implemented for you.
  */
-void* 
-calloc(size_t nmemb, size_t size){
+void* calloc(size_t nmemb, size_t size)
+{
     void* ptr;
     size *= nmemb;
     ptr = malloc(size);
@@ -481,60 +509,139 @@ calloc(size_t nmemb, size_t size){
  * Returns whether the pointer is in the heap.
  * May be useful for debugging.
  */
-static bool 
-in_heap(const void* p){
+static bool in_heap(const void* p)
+{
     return p <= mem_heap_hi() && p >= mem_heap_lo();
 }
 
-static void 
-printblock(Block *bp){
-    if (bp){
-        size_t bsize = get_block_size ( bp );
-        bool   bfree = is_block_free  ( bp, bsize );
-    //printf("p %p - bp %p: %s {next: %p, next_free: %p} bsize=%llu\n",&bp->data[0],bp,(bp->bsize&1)?"A":"F",bp -> prev, bp -> prev_free, bp -> next_free, bp -> bsize & ~1ull);
-        printf("bp %p: %s {next: %p, next_free: %p} bsize=%lu\n",bp,(bfree)?"F":"A",bp -> next, bp -> next_free, bsize );
-    }
+/*
+ * Returns whether the pointer is aligned.
+ * May be useful for debugging.
+ */
+static bool aligned(const void* p)
+{
+    size_t ip = (size_t) p;
+    return align(ip) == ip;
 }
 
-static void
-printlist(void){
-    for ( Block * pb = head_list; pb; pb = pb -> next ) printblock(pb);
+void printFree(void){
+    size_t * p;
+    for ( int i = 0; i < BSZ_LEN; ++i  ){
+    for ( p = free_head[i]; p; p = (size_t*)p[1] ){
+        size_t hsize  = GET_SIZE(HDRP(p));
+        size_t halloc = GET_ALLOC(HDRP(p));  
+        printf("free %4d: bp %p  prev %p  next %p  size %ld  %s\n",32<<i,p,(size_t*)(p[0]),(size_t*)(p[1]),hsize,halloc?"A":"F");
+    }
+    }
+
+}
+void printHeap(void){
+    void * bp;
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        size_t hsize  = GET_SIZE(HDRP(bp));
+        size_t halloc = GET_ALLOC(HDRP(bp));  
+        printf("heap: bp %p  size %ld  %s\n",bp,hsize,halloc?"A":"F");
+    }
+
+}
+
+static void printblock(void *bp) 
+{
+    size_t hsize, halloc, fsize, falloc;
+
+    mm_checkheap(0);
+    hsize = GET_SIZE(HDRP(bp));
+    halloc = GET_ALLOC(HDRP(bp));  
+    fsize = GET_SIZE(FTRP(bp));
+    falloc = GET_ALLOC(FTRP(bp));  
+
+    if (hsize == 0) {
+        printf("%p: EOL\n", bp);
+        return;
+    }
+
+    printf("%p: header: [%ld:%c] footer: [%ld:%c]\n", bp, 
+           hsize, (halloc ? 'a' : 'f'), 
+           fsize, (falloc ? 'a' : 'f')); 
+}
+
+static void checkblock(void *bp) 
+{
+    if ((size_t)bp % 8)
+        printf("Error: %p is not doubleword aligned\n", bp);
+    if (GET(HDRP(bp)) != GET(FTRP(bp)))
+        printf("Error: header does not match footer\n");
+}
+
+static void prn(void){
+    printHeap();
+    printFree();
 }
 
 /*
  * mm_checkheap
  */
-bool 
-mm_checkheap(int lineno){
+bool mm_checkheap(int lineno)
+{
+#ifdef DEBUG
+    /* Write code to check heap invariants here */
+    /* IMPLEMENT THIS */
+    {
+    char *bp = heap_listp;
 
-    #ifdef DEBUG
-#if 0
-    Block * pb; 
-    for ( pb = head_list; pb; pb = pb -> next ) {
-        if ( pb -> next &&  (Block*)((char*)pb + (pb -> bsize&~1ull)) > pb -> next ){
-            printf("%d overflow bp=%p\n",lineno,pb); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            return false;
-        }
-        if ( pb -> next && pb -> next -> prev != pb ){
-            printf("%d order bp=%p\n",lineno,pb); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            return false;
-        }
-        if ( pb -> prev && pb -> prev -> prev == pb -> prev ){
-            printf("%d duplicate prev=%p\n",lineno,pb->prev); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            return false;
-        }
-        if ( pb -> prev && pb -> prev -> next == pb -> next ){
-            printf("%d duplicate next=%p\n",lineno,pb->next); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            return false;
-        }
-        if ( !pb -> next && pb != tail_list ){
-            printf("%d lost tail! tail=%p list_last=%p\n",lineno,tail_list,pb); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
+    if (lineno)
+        printf("Heap (%p):\n", heap_listp);
+
+    if ((GET_SIZE(HDRP(heap_listp)) != DSIZE) || !GET_ALLOC(HDRP(heap_listp)))
+        printf("Bad prologue header\n");
+    checkblock(heap_listp);
+
+    size_t total_size = 0, free_size_total = 0;
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        if (lineno) 
+            printblock(bp);
+        checkblock(bp);
+        total_size += GET_SIZE(HDRP(bp));
+        if ( !GET_ALLOC(HDRP(bp)) )
+            free_size_total += GET_SIZE(HDRP(bp));
+    }
+
+
+    if (lineno)
+        printblock(bp);
+    if ((GET_SIZE(HDRP(bp)) != 0) || !(GET_ALLOC(HDRP(bp))))
+        printf("Bad epilogue header\n");
+
+    //size_t free_size = 0;
+    {
+        size_t *bp, *p;
+        for ( int i = 0; i < BSZ_LEN; ++i ){
+            for (bp = free_head[i]; bp ; bp = (size_t*)bp[1] ){
+                if (GET_ALLOC(HDRP(bp))) {
+                    printf("Bad Free Block!\n");
+                    abort();
+                }
+                //free_size = GET_SIZE(HDRP(bp));
+        
+                for ( p = (size_t*)heap_listp; GET_SIZE(HDRP(p)) > 0; p = NEXT_BLKP(p)) {
+                    if ( bp == p )
+                        break;
+                }
+                if ( bp != p ){
+                    prn();
+                    printf("Bad Free List!\n");
+                    abort();
+                }
+
+            }
         }
     }
-#endif
-    { printf("line: %d head_list: %p  tail_list: %p  head_free: %p\n",lineno,head_list,tail_list,head_free); printlist(); }
-    #endif
 
+   //if( free_size != free_size_total ){
+   //    printf("free_size = %ld free_size_total=%ld total=%ld total_size=%ld\n",free_size,free_size_total,total, total_size);
+   //     abort();
+   //}
+    }
+#endif
     return true;
 }
-

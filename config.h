@@ -20,6 +20,7 @@
  * traces from the driver's test suite.
  */
 
+
 #define DEFAULT_TRACEFILES \
   "syn-array-short.rep", \
   "syn-struct-short.rep", \
