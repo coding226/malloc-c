@@ -51,61 +51,29 @@ static void printlist(void);
 
 /* One block of memory with Header and payload */
 typedef struct Block {
-    struct Block *prev,         /* Pointer to prev block    */
-                 *next;         /* Pointer to next block    */
-    size_t bsize,               /* Block size = header + payload */
-           padd;
-    long data[1];               /* Payload */
+    struct Block *next_free,    /* Pointer to next free block    */
+                 *next;         /* Pointer to next block         */
+    long   data[1];             /* Payload */
+    size_t bsize;               /* Block size in the end of the block */
 } Block;
 
-static Block *head_list = NULL,
-             *tail_list = NULL,
-             *head_free = NULL;
-static size_t bsize_of_minblock= 0;
+#define HEADER_SIZE (sizeof(Block)-sizeof(long))
+
+static Block *head_list = NULL, /* head list of blocks */
+             *tail_list = NULL, /* tail list of blocks */
+             *head_free = NULL; /* head list of free blocks */
+
+static size_t bsize_of_minblock = 0,    /* minimal size of block    */
+              bsize_of_allblock = 0;    /* total size of all blocks */
 
 
-
-/* rounds up to the nearest multiple of ALIGNMENT */
+/* rounds up the size to the nearest multiple of ALIGNMENT */
 static size_t
 align_size ( size_t size ){
-    size_t bsize = size + sizeof(Block) - sizeof(long);
+    size_t bsize = size + HEADER_SIZE;
     if ( bsize & 0xF )
-        bsize = ((bsize >> 4) + 1 ) << 4;
+        bsize = ((bsize >> 4) + 1uLL ) << 4;
     return bsize;
-}
-
-static Block *
-extend_heap (size_t bsize){
-    size_t pagesize = mem_pagesize();
-
-    Block * bp = NULL;
-
-    if ( bsize != pagesize )
-        bsize = (bsize/pagesize+1)*pagesize;
-
-    Block * p = (Block*) mem_sbrk ( bsize );
-    if ( p != (Block*)-1 ){
-
-        if ( tail_list ){
-            tail_list -> next     = p;
-            p -> prev             = tail_list;
-            tail_list             = p;
-        }
-        else {
-            p -> prev             = NULL;
-            head_list = tail_list = p;
-        }
-
-        if ( !head_free )
-            head_free = p;
-
-        p -> bsize = bsize;
-        p -> next  = NULL;
-
-        bp = p;
-    }
-
-    return bp;
 }
 
 /*
@@ -116,72 +84,191 @@ mm_init(void){
 
     head_list = tail_list = head_free = NULL;
 
+    bsize_of_allblock = 0;
     bsize_of_minblock = align_size (1);
+
+    dbg_printf("\n ******** mm_init ******************\n\n");
 
     return true;
 }
 
 
-static Block*
-get_next_block ( Block * bp ){
-    return (Block*)((char*)bp + (bp -> bsize & ~1ull));
+
+/* Store size of the block at the end of the block */
+static void
+set_block_size ( Block * bp, size_t bsize ){
+    *((size_t*)bp + bsize/sizeof(size_t) - 1) = bsize;
 }
 
-static void*
-find_fit(size_t bsize){
-    Block * bp, *start;
-    if ( head_free )
-        start = head_free;
-    else
-        start = tail_list;
-    for ( bp = start; bp; bp = bp -> next ){
-        if ( !(bp -> bsize & 1) && bp -> bsize >= bsize )
+/* Return size of the block */
+static size_t
+get_block_size ( Block * bp ){
+    size_t bsize;
+    if ( bp == tail_list ){
+        bsize = *((size_t*)head_list + bsize_of_allblock/sizeof(size_t) - 1);
+    }
+    else {
+        bsize = *((size_t*)bp -> next - 1);
+    }
+    return bsize & ~1ull;
+}
+
+/* Check if the block free*/
+static int
+is_block_free ( Block * bp, size_t bsize ){
+    return !((*((size_t*)bp + bsize/sizeof(size_t) - 1)) & 1 );
+}
+
+/* Mark the block as free */
+static void
+set_block_free ( Block * bp, size_t bsize ){
+    size_t
+    *psize = (size_t*)bp + bsize/sizeof(size_t) - 1;
+    *psize ^= 1;
+}
+
+/* Mark the block as no free */
+static void
+set_block_allc ( Block * bp, size_t bsize ){
+    size_t
+    *psize = (size_t*)bp + bsize/sizeof(size_t) - 1;
+    *psize |= 1;
+}
+
+/* Get prev block by size */
+static Block*
+prev_block ( Block * bp ){
+    size_t prev_size = *((size_t*)bp-1) & ~1ull;
+    return (Block*)((char*)bp - prev_size);
+}
+
+/* Get next block by size */
+static Block*
+next_block ( Block * bp ){
+    return (Block*)((char*)bp + get_block_size(bp));
+}
+
+/* Find the first  fit-free block */
+static Block*
+find_fit(size_t bsize, Block **prev_free){
+    Block * bp;
+    for ( bp = head_free, *prev_free = NULL; bp; bp = bp -> next_free ){
+        size_t bp_bsize = get_block_size ( bp );
+        if ( bp_bsize >= bsize )
             break;
+        *prev_free = bp;
     }
     return bp;
 }
 
-static void
-alloc_block ( Block * bp, size_t bsize ){
-    Block *bn;
-    size_t ds = bp -> bsize - bsize;
+/* Split free block by two if possible  */
+static Block*
+split_block ( Block * bp, size_t bsize, size_t * new_bsize ){
+    Block *bp_new  = (Block*)((char*)bp + bsize);
 
-    bp -> bsize = bsize;
+    size_t old_size = get_block_size(bp),
+           new_size = old_size - bsize;
 
-    if (  ds >= bsize_of_minblock ){               /* Split block if possible */
+    *new_bsize = old_size;
+    /* Size of the new block must be greater than min block size */
+    if (  new_size >= bsize_of_minblock ){               
 
-        bn = get_next_block ( bp );
+        /* fix size of blocks */
+        set_block_size ( bp    , bsize    );
+        set_block_size ( bp_new, new_size );
 
-        bn -> bsize = ds;
-        bn -> prev      = bp;
-        bn -> next      = bp -> next;
-        bp -> next      = bn;
+        bp_new -> next      = bp -> next;
+        bp_new -> next_free = bp -> next_free;
 
-        if ( bn -> next )
-            bn -> next -> prev = bn;
+        bp -> next      = bp_new;
+        bp -> next_free = bp_new;
 
         if ( tail_list == bp )
-            tail_list = bn;
-        if ( head_free == bp )
-            head_free = bn;
+            tail_list = bp_new;
+
+        *new_bsize = bsize;
     }
 
-    bp -> bsize |=1;
-
-    if ( bp == head_free )
-        head_free = NULL;
+    return bp;
 }
 
+/* Mark a free block as no free */
+static void
+alloc_block ( Block * bp, size_t bsize, Block * prev_free ){
+
+    set_block_allc ( bp, bsize );
+
+    if ( prev_free ){
+        prev_free -> next_free = bp -> next_free;
+    }
+
+    if ( head_free == bp )
+        head_free = bp -> next_free;
+
+    //bp -> next_free = NULL;
+}
+
+/* Return start of the block by pointer (from malloc, free) */
 static Block*
 get_block_ptr ( void *ptr ){
-    return (Block*)((char*)ptr - sizeof(Block) + sizeof(long));
+    return (Block*)((char*)ptr - 2*sizeof(void*));
 }
 
+/* Return size of data in the Block */
 static size_t
 get_data_size ( Block * bp ){
-    size_t s =  bp -> bsize + sizeof(long);
-    return s - sizeof(Block); 
+    size_t s =  get_block_size(bp);
+    return s - HEADER_SIZE; 
 }
+
+/* Extend the process heap */
+static Block *
+extend_heap (size_t bsize, Block * prev_free){
+    /* min alloc equal pagesize */
+    size_t pagesize = 4096;//mem_pagesize();
+
+    bsize = (bsize/pagesize+1)*pagesize;
+
+    Block* bp = (Block*) mem_sbrk ( bsize );
+    if ( bp != (Block*) -1 ){
+        if ( tail_list ){
+            //size_t tail_bsize = get_block_size ( tail_list);
+            //if ( !is_block_free ( tail_list, tail_bsize) ){
+
+                bp -> next      = NULL;
+                bp -> next_free = NULL;
+
+                set_block_size ( bp, bsize );
+
+                tail_list -> next = bp;
+                tail_list = bp;
+
+                if ( prev_free )
+                    prev_free -> next_free = bp;
+                else
+                    head_free = bp;
+
+            //}
+            //else {
+            //    set_block_size ( tail_list, bsize + tail_bsize );
+            //    bp = tail_list;
+            //}
+        }
+        else{
+            head_list = tail_list = head_free = (Block*)bp;
+            tail_list -> next      = NULL;
+            tail_list -> next_free = NULL;
+            set_block_size ( bp, bsize );
+        }
+
+        bsize_of_allblock += bsize;
+    }
+    else
+        bp = NULL;
+
+    return bp;
+}
+
  
 
 /*
@@ -189,102 +276,136 @@ get_data_size ( Block * bp ){
  */
 void* 
 malloc(size_t size){
-    Block *bp = NULL; 
-
+    Block *bp = NULL, *prev_free = NULL; 
     //mm_checkheap (__LINE__);
-
     if (size){
-
+        /* bsize is multiple 16 */
         size_t bsize = align_size ( size );
+        /* search the first free block */
+        bp = find_fit ( bsize, &prev_free );
 
-        bp = find_fit ( bsize );
+        /* if no free block expand the heap */
+        if ( !bp ){
+            bp = extend_heap ( bsize, prev_free );
+        }
 
-        if ( !bp )
-            bp = extend_heap ( bsize );
-
-        if ( bp )
-            alloc_block ( bp, bsize );
+        if ( bp ){
+            size_t new_bsize;
+            /* try to split */
+            split_block ( bp, bsize, &new_bsize );
+            /* mark as no free */
+            alloc_block ( bp, new_bsize, prev_free );
+        }
 
         dbg_printf("\nmalloc: %p  bp %p size=%ld bsize=%ld\n",&bp->data[0],bp,size,bsize);
     }
 
     mm_checkheap (__LINE__);
 
-    //{ Block * p; for ( p = head_list; p; p = p -> next ) if ( p == bp ) break; if ( p != bp ){ printf("bp: %p not found in list!\n",bp); abort(); } }
     return bp ? &bp -> data[0] : NULL;
 } 
+
+/* Find a previous free block than point at the block */
+static Block*
+find_prev_free ( Block * bp ){
+    Block* prev_free = NULL, *p;
+
+    for ( p = head_free; p; p = p -> next_free ){
+        if ( p == bp )
+            break;
+        prev_free = p;
+    }
+
+    return prev_free;
+}
 
 /*
  * free
  */
 void 
 free(void* ptr){
-    bool prev_free, next_free;
+    Block * bp = get_block_ptr ( ptr ),
+          * bp_prev = NULL,
+          * bp_next = NULL;
+    size_t  sz_prev = 0,
+            sz_next = 0;
 
-    Block * bp = get_block_ptr ( ptr );
+    bool prev_free = false, next_free = false;
 
     dbg_printf("\nfree  : %p  bp %p\n",ptr,bp);
 
-    prev_free = (bp -> prev && !(bp -> prev -> bsize & 1 )) ? true : false;
-    next_free = (bp -> next && !(bp -> next -> bsize & 1 )) ? true : false;
+    if ( head_list != bp ){
+        bp_prev   = prev_block (bp);
+        sz_prev   = get_block_size ( bp_prev );
+        prev_free = is_block_free  ( bp_prev, sz_prev );
+    }
+    if ( tail_list != bp ){
+        bp_next   = bp -> next;
+        sz_next   = get_block_size ( bp_next );
+        next_free = is_block_free  ( bp_next, sz_next );
+    }
 
-    bp -> bsize &= ~1ull;
+    size_t bsize = get_block_size ( bp );
 
+    set_block_free ( bp, bsize );
+
+    /* merge with the previous */
     if (  prev_free && !next_free ){
+
+        set_block_size ( bp_prev, sz_prev + bsize );
+
+        bp_prev -> next = bp -> next;
+
         if ( bp == tail_list )
-            tail_list = bp -> prev;
-        bp -> prev -> bsize += bp -> bsize;
-        bp -> prev -> next   = bp -> next;
-        if ( bp -> next )
-            bp -> next -> prev = bp -> prev;
-
-        if ( head_free ){
-            if ( head_free > bp -> prev )
-                head_free = bp -> prev;
-        }
-        else 
-            head_free = bp -> prev;
+            tail_list = bp_prev;
     }
     else
+    /* merge with the next */
     if ( !prev_free && next_free  ){
-        if ( bp -> next == tail_list )
-            tail_list = bp;
-        bp -> bsize += bp -> next -> bsize;
-        if ( bp -> next -> next )
-            bp -> next -> next -> prev = bp;
-        bp -> next   = bp -> next -> next;
 
-        if ( head_free ){
-            if ( head_free > bp )
-                head_free = bp;
-        }
-        else 
+        set_block_size ( bp, sz_next + bsize );
+
+        bp -> next = bp_next -> next;
+
+        if ( bp_next == tail_list )
+            tail_list = bp;
+
+        Block* prev_free = find_prev_free ( bp_next );
+
+        if ( prev_free )
+            prev_free -> next_free = bp;
+        else
+        if ( head_free == bp_next )
             head_free = bp;
+
+        bp -> next_free = bp_next -> next_free;
+
     }
     else
+    /* merge with the previous and the next */
     if (  prev_free && next_free  ){
-        if ( bp -> next == tail_list )
-            tail_list = bp -> prev;
-        bp -> prev -> bsize += bp -> bsize + bp -> next -> bsize;
-        bp -> prev -> next = bp -> next -> next;
-        if ( bp -> next -> next )
-            bp -> next -> next -> prev = bp -> prev;
 
-        if ( head_free ){
-            if ( head_free > bp -> prev )
-                head_free = bp -> prev;
-        }
-        else 
-            head_free = bp -> prev;
+        set_block_size ( bp_prev, sz_prev + sz_next + bsize );
+
+        bp_prev -> next = bp_next -> next;
+
+        if ( bp_next == tail_list )
+            tail_list = bp_prev;
+
+        Block* prev_free = find_prev_free ( bp_next );
+        if ( prev_free )
+            prev_free -> next_free = bp_next -> next_free;
+        else
+        if ( head_free == bp_next )
+            head_free = bp_next -> next_free;
     }
     else 
     if ( !prev_free && !next_free ){
-        if ( head_free ){
-            if ( head_free > bp )
-                head_free = bp;
-        }
-        else 
-            head_free = bp;
+        if ( head_free )
+            bp -> next_free = head_free;
+        else
+            bp -> next_free = NULL;
+        head_free = bp;
     }
 
     mm_checkheap ( __LINE__ );
@@ -367,8 +488,12 @@ in_heap(const void* p){
 
 static void 
 printblock(Block *bp){
-    if (bp)
-    printf("p %p - bp %p: %s {prev: %p, next: %p} bsize=%llu\n",&bp->data[0],bp,(bp -> bsize & 1) ? "A":"F", bp -> prev, bp -> next, bp -> bsize & ~1ull);
+    if (bp){
+        size_t bsize = get_block_size ( bp );
+        bool   bfree = is_block_free  ( bp, bsize );
+    //printf("p %p - bp %p: %s {next: %p, next_free: %p} bsize=%llu\n",&bp->data[0],bp,(bp->bsize&1)?"A":"F",bp -> prev, bp -> prev_free, bp -> next_free, bp -> bsize & ~1ull);
+        printf("bp %p: %s {next: %p, next_free: %p} bsize=%lu\n",bp,(bfree)?"F":"A",bp -> next, bp -> next_free, bsize );
+    }
 }
 
 static void
@@ -376,32 +501,15 @@ printlist(void){
     for ( Block * pb = head_list; pb; pb = pb -> next ) printblock(pb);
 }
 
-static void 
-checkblock(void *bp){
-    (void)bp;
-}
 /*
  * mm_checkheap
  */
 bool 
 mm_checkheap(int lineno){
-    #ifdef DEBUG
-    Block * pb; 
-    #endif
-    if ( head_list && head_list -> prev ){
-            #ifdef DEBUG
-            printf("%d bad head =%p\n",lineno,head_list); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            #endif
-            return false;
-    }
-    if ( tail_list && (tail_list -> next || (tail_list -> prev && tail_list -> prev < (Block*)0x10000) ) ){
-            #ifdef DEBUG
-            printf("%d bad tail =%p\n",lineno,tail_list); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
-            #endif
-            return false;
-    }
 
     #ifdef DEBUG
+#if 0
+    Block * pb; 
     for ( pb = head_list; pb; pb = pb -> next ) {
         if ( pb -> next &&  (Block*)((char*)pb + (pb -> bsize&~1ull)) > pb -> next ){
             printf("%d overflow bp=%p\n",lineno,pb); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
@@ -423,8 +531,8 @@ mm_checkheap(int lineno){
             printf("%d lost tail! tail=%p list_last=%p\n",lineno,tail_list,pb); for ( pb = head_list; pb; pb = pb -> next ) printblock(pb); abort();
         }
     }
-
-    { pb = tail_list; int k = 500; while ( pb && pb -> prev && k--) pb = pb -> prev; printf("line: %d\n",lineno);for ( ;pb; pb = pb -> next ) printblock(pb); }
+#endif
+    { printf("line: %d head_list: %p  tail_list: %p  head_free: %p\n",lineno,head_list,tail_list,head_free); printlist(); }
     #endif
 
     return true;
